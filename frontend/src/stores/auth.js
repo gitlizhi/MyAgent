@@ -7,6 +7,11 @@ export const useAuthStore = defineStore('auth', () => {
   const user = ref(JSON.parse(localStorage.getItem('user') || 'null'))
   const isAuthenticated = computed(() => !!token.value)
 
+  // 初始化时，如果token存在，设置axios默认授权头
+  if (token.value) {
+    axios.defaults.headers.common['Authorization'] = `Bearer ${token.value}`
+  }
+
   // 设置 token
   const setToken = (newToken) => {
     token.value = newToken

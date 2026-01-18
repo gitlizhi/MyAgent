@@ -226,6 +226,7 @@ class ConversationDB:
                         conversation_id VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                         role VARCHAR(20) NOT NULL,
                         content TEXT NOT NULL,
+                        content_vector VECTOR(1536),
                         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -235,6 +236,18 @@ class ConversationDB:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversations_updated_at ON conversations(updated_at)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)")
+                
+                # 单独添加向量列，确保无论表是否已存在，都会尝试添加列
+                try:
+                    cursor.execute("ALTER TABLE messages ADD COLUMN content_vector VECTOR(1536)")
+                    logger.info("Added content_vector column to messages table")
+                except Exception as e:
+                    # 如果列已存在，忽略异常
+                    if "already exists" in str(e).lower() or "duplicate column" in str(e).lower():
+                        logger.info("content_vector column already exists in messages table")
+                    else:
+                        # 其他异常则抛出
+                        raise
 
                 conn.commit()
                 logger.info("Conversation tables created or already exist")
@@ -267,18 +280,24 @@ class ConversationDB:
             if conn:
                 self.connection_pool.putconn(conn)
 
-    def add_message(self, conversation_id: str, role: str, content: str):
-        """添加消息到对话 - 确保消息正确保存"""
+    def add_message(self, conversation_id: str, role: str, content: str, embedding=None):
+        """添加消息到对话 - 确保消息正确保存，支持向量嵌入"""
         conn = None
         try:
             message_id = str(uuid.uuid4())
             conn = self.connection_pool.getconn()
             with conn.cursor() as cursor:
-                # 插入消息
-                cursor.execute(
-                    "INSERT INTO messages (id, conversation_id, role, content) VALUES (%s, %s, %s, %s)",
-                    (message_id, conversation_id, role, content)
-                )
+                # 插入消息，支持向量嵌入
+                if embedding:
+                    cursor.execute(
+                        "INSERT INTO messages (id, conversation_id, role, content, content_vector) VALUES (%s, %s, %s, %s, %s::vector)",
+                        (message_id, conversation_id, role, content, embedding)
+                    )
+                else:
+                    cursor.execute(
+                        "INSERT INTO messages (id, conversation_id, role, content) VALUES (%s, %s, %s, %s)",
+                        (message_id, conversation_id, role, content)
+                    )
 
                 # 更新对话的更新时间
                 cursor.execute(
@@ -288,9 +307,64 @@ class ConversationDB:
 
                 conn.commit()
                 logger.info(f"Saved message to conversation {conversation_id}: {role} - {content[:50]}...")
+                return message_id
         except Exception as e:
             logger.error(f"Error adding message: {e}")
             raise
+        finally:
+            if conn:
+                self.connection_pool.putconn(conn)
+    
+    def get_relevant_messages(self, conversation_id: str, query_embedding: list, top_k: int = 5) -> list:
+        """使用向量相似度搜索获取相关消息"""
+        conn = None
+        try:
+            conn = self.connection_pool.getconn()
+            with conn.cursor() as cursor:
+                # 使用pgvector的vector_cosine_distance函数进行相似度搜索
+                cursor.execute("""
+                    SELECT role, content, timestamp 
+                    FROM messages 
+                    WHERE conversation_id = %s 
+                    ORDER BY vector_cosine_distance(content_vector, %s::vector) ASC 
+                    LIMIT %s
+                """, (conversation_id, query_embedding, top_k))
+                results = cursor.fetchall()
+
+                messages = []
+                for result in results:
+                    messages.append({
+                        'role': result[0],
+                        'content': result[1],
+                        'timestamp': result[2].isoformat() if result[2] else None
+                    })
+                logger.info(f"Retrieved {len(messages)} relevant messages for conversation: {conversation_id}")
+                return messages
+        except Exception as e:
+            logger.error(f"Error getting relevant messages: {e}")
+            # 出错时返回最近的top_k条消息作为备选
+            recent_messages = self.get_conversation_messages(conversation_id)
+            return recent_messages[-top_k:] if recent_messages else []
+        finally:
+            if conn:
+                self.connection_pool.putconn(conn)
+    
+    def update_message_embedding(self, message_id: str, embedding: list) -> bool:
+        """更新消息的向量嵌入"""
+        conn = None
+        try:
+            conn = self.connection_pool.getconn()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE messages SET content_vector = %s::vector WHERE id = %s",
+                    (embedding, message_id)
+                )
+                conn.commit()
+                logger.info(f"Updated embedding for message: {message_id}")
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error updating message embedding: {e}")
+            return False
         finally:
             if conn:
                 self.connection_pool.putconn(conn)

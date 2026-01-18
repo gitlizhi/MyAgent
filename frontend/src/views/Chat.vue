@@ -497,7 +497,7 @@ const formatMessageTime = (timestamp) => {
   })
 }
 
-// 发送消息 - 关键修改：确保使用同一个对话ID
+// 发送消息 - 关键修改：确保使用同一个对话ID，使用流式响应
 const sendMessage = async () => {
   if (!inputMessage.value.trim() || loading.value || !activeConversationId.value) return
 
@@ -523,31 +523,109 @@ const sendMessage = async () => {
   try {
     console.log('发送消息到对话:', activeConversationId.value)
 
-    // 构建发送给后端的消息 - 关键：始终使用当前活跃的对话ID
+    // 构建发送给后端的消息 - 关键：始终使用当前活跃的对话ID，开启流式响应
     const requestData = {
       messages: [{ role: 'user', content: currentInput }],
-      stream: false,
+      stream: true,
       conversation_id: activeConversationId.value // 使用同一个对话ID
     }
 
     console.log('请求数据:', requestData)
 
-    const response = await axios.post('/api/v1/chat/completions', requestData)
-    console.log('收到AI回复:', response.data)
+    // 使用fetch API处理SSE流式响应
+    const response = await fetch('/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${localStorage.getItem('token')}`
+      },
+      body: JSON.stringify(requestData)
+    })
 
-    const assistantMessage = {
-      id: `assistant-${Date.now()}`,
-      role: 'assistant',
-      content: response.data.choices[0].message.content,
-      timestamp: new Date().toISOString()
+    if (!response.ok) {
+      throw new Error('Network response was not ok')
     }
 
-    // 添加助手消息到当前消息列表
-    currentMessages.value.push(assistantMessage)
-
-    // 更新消息映射
-    conversationMessagesMap.value.set(activeConversationId.value, [...currentMessages.value])
-
+    // 获取响应流
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    
+    let done = false
+    let buffer = ''
+    let assistantMessage = null
+    
+    // 循环读取流数据
+    while (!done) {
+      const { value, done: doneReading } = await reader.read()
+      done = doneReading
+      
+      if (value) {
+        buffer += decoder.decode(value, { stream: true })
+        
+        // 处理缓冲区中的SSE消息
+        let pos = 0
+        while (true) {
+          const lineEnd = buffer.indexOf('\n', pos)
+          if (lineEnd === -1) break
+          
+          const line = buffer.substring(pos, lineEnd).trim()
+          pos = lineEnd + 1
+          
+          // 跳过空行
+          if (!line) continue
+          
+          // 处理SSE数据行
+          if (line.startsWith('data: ')) {
+            const data = line.substring(6)
+            if (data === '[DONE]') {
+              done = true
+              break
+            }
+            
+            try {
+              const jsonData = JSON.parse(data)
+              
+              // 获取增量内容
+              const delta = jsonData.choices[0].delta
+              if (delta.content) {
+                // 只在收到第一个内容块时创建助手消息
+                if (!assistantMessage) {
+                  assistantMessage = {
+                    id: `assistant-${Date.now()}`,
+                    role: 'assistant',
+                    content: '',
+                    timestamp: new Date().toISOString()
+                  }
+                  // 添加临时助手消息到当前消息列表
+                  currentMessages.value.push(assistantMessage)
+                  // 关键修复：收到第一个内容块后，关闭loading状态，隐藏"AI正在思考中..."提示
+                  loading.value = false
+                }
+                
+                // 更新助手消息内容
+                assistantMessage.content += delta.content
+                
+                // 强制Vue更新DOM - 关键修复：通过重新赋值数组来触发响应式更新
+                currentMessages.value = [...currentMessages.value]
+                
+                // 更新消息映射
+                conversationMessagesMap.value.set(activeConversationId.value, [...currentMessages.value])
+                
+                // 滚动到底部
+                await nextTick()
+                scrollToBottom()
+              }
+            } catch (e) {
+              console.error('解析JSON失败:', e)
+            }
+          }
+        }
+        
+        // 保留未处理的部分
+        buffer = buffer.substring(pos)
+      }
+    }
+    
     // 更新对话列表（获取最新更新时间）
     await loadConversations()
 

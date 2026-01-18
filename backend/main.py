@@ -10,7 +10,7 @@ import logging
 # 用于定义异步上下文管理器
 from contextlib import asynccontextmanager
 # 用于类型提示，定义列表和可选参数
-from typing import Tuple, List
+from typing import Tuple, List, Dict, Any
 from model import Message, ChatCompletionRequest, Token, User, ConversationCreate, MessageCreate, \
     ChatCompletionResponseChoice, ChatCompletionResponse, UserRegister, UserLogin, ConversationRename
 from fastapi import FastAPI, HTTPException, Depends, status
@@ -31,6 +31,16 @@ from ragAgent import (
     ConnectionPoolError,
     monitor_connection_pool,
 )
+# 导入向量存储相关库
+from langchain_chroma import Chroma
+from chromadb.config import Settings
+from chromadb import Client as ChromaClient
+from langchain_core.embeddings import Embeddings
+from langchain_core.documents import Document
+
+# 全局向量存储实例
+vector_store = None
+llm_embedding = None
 
 
 # 设置LangSmith环境变量 进行应用跟踪，实时了解应用中的每一步发生了什么
@@ -43,6 +53,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 # logger.setLevel(logging.INFO)
 logger.handlers = []  # 清空默认处理器
+
+# 降低httpx库的日志级别，减少心跳请求日志
+logging.getLogger("httpx").setLevel(logging.WARNING)
 # 使用ConcurrentRotatingFileHandler
 handler = ConcurrentRotatingFileHandler(
     # 日志文件
@@ -113,7 +126,7 @@ async def lifespan(app: FastAPI):
         Exception: 其他未预期的异常。
     """
     # 声明全局变量 graph 和 tool_config
-    global graph, tool_config, user_db, conversation_db
+    global graph, tool_config, user_db, conversation_db, vector_store, llm_embedding
     try:
         # 调用 get_llm 初始化聊天模型和嵌入模型
         llm_chat, llm_embedding = get_llm(Config.LLM_TYPE)
@@ -192,6 +205,70 @@ async def lifespan(app: FastAPI):
         logger.info("Database connection pool closed")
     # 记录服务关闭的日志
     logger.info("The service has been shut down")
+
+
+def get_relevant_history_messages(conversation_id: str, user_input: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    """
+    获取与当前用户输入最相关的历史消息
+
+    Args:
+        conversation_id (str): 对话ID
+        user_input (str): 用户当前输入
+        top_k (int): 返回的相关消息数量，默认5条
+
+    Returns:
+        List[Dict[str, Any]]: 按相关性排序的历史消息列表
+    """
+    global llm_embedding
+    
+    try:
+        # 加载该对话的所有历史消息
+        history_messages = conversation_db.get_conversation_messages(conversation_id)
+        logger.info(f"[DEBUG] Loaded {len(history_messages)} total history messages for conversation {conversation_id}")
+        logger.info(f"[DEBUG] Current user input: {user_input}")
+        
+        if not history_messages:
+            logger.info(f"[DEBUG] No history messages found for conversation {conversation_id}")
+            return []
+        
+        # 如果历史消息不足top_k条，直接返回所有历史消息
+        if len(history_messages) <= top_k:
+            logger.info(f"[DEBUG] History messages ({len(history_messages)}) <= top_k ({top_k}), returning all messages")
+            for i, msg in enumerate(history_messages):
+                logger.info(f"[DEBUG] Message {i+1}: {msg['role']} - {msg['content'][:100]}...")
+            return history_messages
+        
+        # 生成当前用户输入的向量嵌入
+        logger.info(f"[DEBUG] Generating embedding for user input: {user_input[:100]}...")
+        query_embedding = llm_embedding.embed_query(user_input)
+        
+        # 使用PG Vector进行相似度搜索
+        logger.info(f"[DEBUG] Performing similarity search with PG Vector")
+        relevant_messages = conversation_db.get_relevant_messages(conversation_id, query_embedding, top_k)
+        
+        # 确保相关消息按时间排序
+        logger.info(f"[DEBUG] Retrieved {len(relevant_messages)} relevant messages from PG Vector:")
+        for i, msg in enumerate(relevant_messages):
+            logger.info(f"[DEBUG] Relevant message {i+1}: {msg['role']} - {msg['content'][:100]}... (timestamp: {msg['timestamp']})")
+        
+        relevant_messages.sort(key=lambda x: x['timestamp'])
+        
+        logger.info(f"[DEBUG] Relevant messages after time sorting (final result):")
+        for i, msg in enumerate(relevant_messages):
+            logger.info(f"[DEBUG] Final {i+1}: {msg['role']} - {msg['content'][:100]}... (timestamp: {msg['timestamp']})")
+        
+        logger.info(f"[DEBUG] Returning {len(relevant_messages)} relevant messages for conversation {conversation_id}")
+        return relevant_messages
+        
+    except Exception as e:
+        logger.error(f"[DEBUG] Error getting relevant history messages: {e}")
+        # 出错时返回最近的top_k条消息作为备选
+        history_messages = conversation_db.get_conversation_messages(conversation_id)
+        fallback_messages = history_messages[-top_k:] if history_messages else []
+        logger.info(f"[DEBUG] Using fallback: returning {len(fallback_messages)} most recent messages")
+        for i, msg in enumerate(fallback_messages):
+            logger.info(f"[DEBUG] Fallback {i+1}: {msg['role']} - {msg['content'][:100]}... (timestamp: {msg['timestamp']})")
+        return fallback_messages
 
 # 创建 FastAPI 实例, lifespan参数用于在应用程序生命周期的开始和结束时执行一些初始化或清理工作
 app = FastAPI(lifespan=lifespan)
@@ -333,7 +410,8 @@ async def handle_stream_response1(user_input, graph, config):
                 config,
                 stream_mode="messages"
             )
-            # 遍历消息流中的每个数据块
+            # 使用异步方式处理同步生成器，确保实时流式输出
+            import asyncio
             for message_chunk, metadata in stream_data:
                 try:
                     # 获取当前节点名称
@@ -346,6 +424,8 @@ async def handle_stream_response1(user_input, graph, config):
                         logger.info(f"Streaming chunk from {node_name}: {chunk}")
                         # 产出流式数据块
                         yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
+                        # 添加一个小延迟，确保数据能被实时发送到客户端
+                        await asyncio.sleep(0.01)
                 except Exception as chunk_error:
                     # 记录单个数据块处理异常
                     logger.error(f"Error processing stream chunk: {chunk_error}")
@@ -466,7 +546,7 @@ async def handle_non_stream_response(messages, graph, tool_config, config):
     return JSONResponse(content=response.model_dump())
 
 
-async def handle_stream_response(messages, graph, config):
+async def handle_stream_response(messages, graph, config, conversation_id):
     """
     处理流式响应的异步函数，生成并返回流式数据。
 
@@ -474,6 +554,7 @@ async def handle_stream_response(messages, graph, config):
         messages: 完整的消息列表（历史 + 新消息）
         graph: 图对象，用于处理消息流。
         config (dict): 配置参数，包含线程和用户标识。
+        conversation_id: 对话ID，用于保存助手消息到数据库。
 
     Returns:
         StreamingResponse: 流式响应对象，媒体类型为 text/event-stream。
@@ -491,13 +572,16 @@ async def handle_stream_response(messages, graph, config):
         try:
             # 生成唯一的 chunk ID
             chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+            # 初始化完整的助手消息内容
+            full_content = ""
             # 调用 graph.stream 获取消息流，使用完整的消息列表
             stream_data = graph.stream(
                 {"messages": messages, "rewrite_count": 0},
                 config,
                 stream_mode="messages"
             )
-            # 遍历消息流中的每个数据块
+            # 使用异步方式处理同步生成器，确保实时流式输出
+            import asyncio
             for message_chunk, metadata in stream_data:
                 try:
                     # 获取当前节点名称
@@ -508,11 +592,20 @@ async def handle_stream_response(messages, graph, config):
                         chunk = getattr(message_chunk, 'content', '')
                         # 记录流式数据块日志
                         logger.info(f"Streaming chunk from {node_name}: {chunk}")
+                        # 累加完整的助手消息内容
+                        full_content += chunk
                         # 产出流式数据块
                         yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
+                        # 添加一个小延迟，确保数据能被实时发送到客户端
+                        await asyncio.sleep(0.01)
                 except Exception as chunk_error:
                     logger.error(f"Error processing stream chunk: {chunk_error}")
                     continue
+
+            # 流结束后，保存完整的助手消息到数据库
+            if full_content:
+                logger.info(f"Saving complete assistant message to conversation {conversation_id}: {full_content[:50]}...")
+                conversation_db.add_message(conversation_id, "assistant", full_content)
 
             yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
         except Exception as stream_error:
@@ -830,15 +923,18 @@ async def chat_completions(
         for msg in request.messages:
             if msg.role == "user":  # 只保存用户消息
                 logger.info(f"Saving user message to conversation {conversation_id}: {msg.content[:50]}...")
-                conversation_db.add_message(conversation_id, msg.role, msg.content)
+                # 生成消息的向量嵌入
+                message_embedding = llm_embedding.embed_query(msg.content)
+                # 保存消息并包含向量嵌入
+                conversation_db.add_message(conversation_id, msg.role, msg.content, message_embedding)
 
-        # 加载该对话的所有历史消息作为上下文
-        history_messages = conversation_db.get_conversation_messages(conversation_id)
-        logger.info(f"Loaded {len(history_messages)} history messages for conversation {conversation_id}")
+        # 加载与当前用户输入最相关的历史消息作为上下文（最多5条）
+        relevant_messages = get_relevant_history_messages(conversation_id, user_input, top_k=5)
+        logger.info(f"Loaded {len(relevant_messages)} relevant history messages for conversation {conversation_id}")
 
-        # 构建完整的消息列表：所有历史消息
+        # 构建完整的消息列表：相关历史消息 + 当前用户输入
         all_messages = []
-        for msg in history_messages:
+        for msg in relevant_messages:
             all_messages.append({
                 "role": msg['role'],
                 "content": msg['content']
@@ -855,8 +951,7 @@ async def chat_completions(
 
         # 使用完整的消息列表（所有历史消息）调用AI
         if request.stream:
-            response = await handle_stream_response(all_messages, graph, config)
-            # 对于流式响应，我们无法在流结束前保存助手消息
+            response = await handle_stream_response(all_messages, graph, config, conversation_id)
             return response
 
         # 非流式输出
@@ -868,7 +963,10 @@ async def chat_completions(
             response_data = json.loads(response.body.decode())
             assistant_content = response_data['choices'][0]['message']['content']
             logger.info(f"Saving assistant message to conversation {conversation_id}: {assistant_content[:50]}...")
-            conversation_db.add_message(conversation_id, "assistant", assistant_content)
+            # 生成助手消息的向量嵌入
+            assistant_embedding = llm_embedding.embed_query(assistant_content)
+            # 保存助手消息并包含向量嵌入
+            conversation_db.add_message(conversation_id, "assistant", assistant_content, assistant_embedding)
 
         # 返回对话ID和更新后的对话信息
         response_data = json.loads(response.body.decode())
